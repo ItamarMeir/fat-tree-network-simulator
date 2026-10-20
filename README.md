@@ -9,7 +9,7 @@ No dependencies — open `fat_tree_simulator.html` in any modern browser.
 
 ## Features
 
-- **Topology builder** — 2-tier (spine-leaf) and 3-tier fat-tree, configurable k-ary parameter (even, 2–16)
+- **Topology builder** — 2-tier (spine-leaf) and 3-tier fat-tree, configurable k-ary parameter (power of 2: 2, 4, 8, 16)
 - **ECMP path selection** — deterministic enumeration of all (k/2)² cross-pod paths; configurable path count with balanced stride selection
 - **Traffic presets** — Tornado (half-tree shift permutation) and Permutation patterns; fully custom connections
 - **Real-time animation** — packet dots travel along chosen ECMP paths at configurable link rate

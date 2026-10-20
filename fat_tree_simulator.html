@@ -500,8 +500,13 @@
             </select>
           </div>
           <div>
-            <label for="k">k-ary (even)</label>
-            <input id="k" type="number" min="2" max="16" step="2" value="4" />
+            <label for="k">k-ary (power of 2)</label>
+            <select id="k">
+              <option value="2">2</option>
+              <option value="4" selected>4</option>
+              <option value="8">8</option>
+              <option value="16">16</option>
+            </select>
           </div>
         </div>
         <div class="row">
@@ -780,7 +785,7 @@
   function clampK(k) {
     if (!Number.isFinite(k)) return 4;
     k = Math.max(2, Math.min(MAX_K, k));
-    return k % 2 === 0 ? k : k + 1;
+    return 2 ** Math.round(Math.log2(k)); // nearest power of 2
   }
 
   function shuffle(array) {
