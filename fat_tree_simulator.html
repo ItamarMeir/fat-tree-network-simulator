@@ -835,7 +835,10 @@
     const hostIds = [];
 
     if (tiers === 2) {
-      const spineCount = k;
+      // Non-blocking folded Clos: each radix-k leaf has k/2 ports down to hosts
+      // and k/2 ports up to spines, so k/2 spines and k/2 ECMP paths between
+      // hosts on different leaves. Leaf count is bounded by spine radix k.
+      const spineCount = k / 2;
       const leafCount = k;
       const hostPerLeaf = k / 2;
 
@@ -955,6 +958,7 @@
   function applyViewTransform() {
     if (!zoomLayerEl) return;
     zoomLayerEl.setAttribute('transform', `translate(${viewState.tx},${viewState.ty}) scale(${viewState.scale})`);
+    if (pathLayerEl && lastHighlightedPaths) rebuildPathHighlights(lastHighlightedPaths);
   }
 
   function updateGraphPositions(scale) {
@@ -1158,18 +1162,40 @@
   function rebuildPathHighlights(paths) {
     if (!pathLayerEl) return;
     while (pathLayerEl.firstChild) pathLayerEl.removeChild(pathLayerEl.firstChild);
+    // Group colors per physical link so connections sharing it split its width equally.
+    const shared = new Map();
     paths.forEach((path) => {
       path.edges.forEach((edge) => {
         const source = graph.nodeById.get(edge.source);
         const target = graph.nodeById.get(edge.target);
         if (!source || !target) return;
+        const key = linkKey(edge.source, edge.target);
+        if (!shared.has(key)) shared.set(key, { source, target, colors: [] });
+        const group = shared.get(key);
+        if (!group.colors.includes(path.color)) group.colors.push(path.color);
+      });
+    });
+    const pxPerUnit = svg.getBoundingClientRect().width / 1200 || 1;
+    shared.forEach(({ source, target, colors }) => {
+      const n = colors.length;
+      const laneW = Math.min(2.6 + 1.2 * (n - 1), 8) / n;
+      const dx = target.x - source.x;
+      const dy = target.y - source.y;
+      const len = Math.hypot(dx, dy) || 1;
+      colors.forEach((color, i) => {
+        // Offset in screen px, converted to user units (strokes are non-scaling).
+        const off = ((i - (n - 1) / 2) * laneW) / (viewState.scale * pxPerUnit);
+        const ox = (-dy / len) * off;
+        const oy = (dx / len) * off;
         const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-        line.setAttribute("x1", source.x);
-        line.setAttribute("y1", source.y);
-        line.setAttribute("x2", target.x);
-        line.setAttribute("y2", target.y);
+        line.setAttribute("x1", source.x + ox);
+        line.setAttribute("y1", source.y + oy);
+        line.setAttribute("x2", target.x + ox);
+        line.setAttribute("y2", target.y + oy);
         line.setAttribute("class", "edge path");
-        line.style.stroke = path.color;
+        line.style.stroke = color;
+        line.style.strokeWidth = `${laneW}px`;
+        line.style.strokeLinecap = "butt";
         pathLayerEl.appendChild(line);
       });
     });
