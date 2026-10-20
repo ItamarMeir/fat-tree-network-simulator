@@ -209,7 +209,6 @@
   .node.overflow {
     stroke: #c04b4b;
     stroke-width: 2.4;
-    filter: drop-shadow(0 0 6px rgba(192, 75, 75, 0.35));
     transform-box: fill-box;
     transform-origin: center;
     animation: node-pulse 0.9s ease-in-out infinite;
@@ -219,8 +218,8 @@
     fill: #2b2622;
   }
   .edge {
-    stroke: #cdbfb2;
-    stroke-width: 1.2;
+    stroke: var(--u-stroke, #cdbfb2);
+    stroke-width: var(--u-w, 1.2);
     vector-effect: non-scaling-stroke;
   }
   .edge.overflow {
@@ -233,7 +232,6 @@
     stroke-width: 2.6;
   }
   .pod-band {
-    fill: #f4eee6;
     opacity: 0.55;
   }
   .pod-label {
@@ -243,9 +241,9 @@
   }
 
   .packet {
-    fill: var(--path);
     stroke: #fff;
     stroke-width: 1.2;
+    vector-effect: non-scaling-stroke;
   }
 
   svg { cursor: grab; }
@@ -467,6 +465,14 @@
     0%, 100% { opacity: 0.7; }
     50% { opacity: 1; }
   }
+  @media (prefers-reduced-motion: reduce) {
+    .node.overflow,
+    .edge.overflow,
+    .heat-row.overflow,
+    .heat-row.overflow .heat-fill {
+      animation: none;
+    }
+  }
 
   @media (max-width: 980px) {
     .app { grid-template-columns: 1fr; }
@@ -491,12 +497,11 @@
             <select id="tiers">
               <option value="2">2-tier</option>
               <option value="3" selected>3-tier</option>
-              <option value="4">4-tier (scaled)</option>
             </select>
           </div>
           <div>
             <label for="k">k-ary (even)</label>
-            <input id="k" type="number" min="2" step="2" value="4" />
+            <input id="k" type="number" min="2" max="16" step="2" value="4" />
           </div>
         </div>
         <div class="row">
@@ -512,7 +517,7 @@
         <div class="row">
           <div>
             <label for="bdpDepth">Queue depth (x BDP, 0 = no queue)</label>
-            <input id="bdpDepth" type="number" min="0" max="8" value="2" />
+            <input id="bdpDepth" type="number" min="0" max="8" step="any" value="2" />
           </div>
           <div>
             <label>&nbsp;</label>
@@ -536,7 +541,7 @@
         <div class="row">
           <div>
             <label for="rate">Default rate (pps)</label>
-            <input id="rate" type="number" min="1" max="60" value="6" />
+            <input id="rate" type="number" min="1" max="120" value="6" />
           </div>
           <div>
             <label for="pathCount">Default ECMP paths</label>
@@ -572,7 +577,7 @@
           <span>To</span>
           <span>Rate</span>
           <span>ECMP</span>
-          <input type="checkbox" id="selectAllConns" checked title="Select all" style="margin:0 auto;display:block;" />
+          <input type="checkbox" id="selectAllConns" checked title="Select all" aria-label="Select all connections" style="margin:0 auto;display:block;" />
           <span></span>
         </div>
         <div class="conn-list" id="connList"></div>
@@ -596,7 +601,7 @@
         </div>
 
         <h2 style="margin-top:16px;">Live log</h2>
-        <div class="log" id="log"></div>
+        <div class="log" id="log" role="log" aria-live="polite"></div>
 
         <h2 style="margin-top:16px;">Utilization heatmap</h2>
         <div class="heatmap" id="heatmap"></div>
@@ -612,8 +617,8 @@
   <div class="resize-handle" id="resizeHandle"></div>
 
   <section class="canvas-wrap">
-    <svg id="topology" viewBox="0 0 1200 600" aria-label="Fat-tree topology"></svg>
-    <button class="zoom-reset-btn" id="resetViewBtn" title="Reset zoom and pan (0)">⟳</button>
+    <svg id="topology" viewBox="0 0 1200 600" role="application" tabindex="0" aria-label="Fat-tree topology. Plus and minus zoom, arrow keys pan, 0 resets."></svg>
+    <button class="zoom-reset-btn" id="resetViewBtn" title="Reset zoom and pan (0)" aria-label="Reset zoom and pan">⟳</button>
   </section>
 </div>
 
@@ -657,9 +662,13 @@
   const linkOverflowUntil = new Map();
   const nodeOverflowUntil = new Map();
   const linkDropCount = new Map();
-  const linkUsage = new Map();
   const linkUtil = new Map();
+  // Per-link aggregates (keyed by undirected link.key) derived from the directed state below.
   const linkQueue = new Map();
+  // Directed queue state, keyed "src|dst": each cable direction has its own queue and drop counter.
+  const dirQueue = new Map();
+  const dirDrops = new Map();
+  let manualHighlight = null; // path from "Send 1 packet", stays highlighted until replaced
 
   const svgLinkEls = new Map();
   const svgNodeEls = new Map();
@@ -670,9 +679,18 @@
   let zoomLayerEl = null;
   const _colorCache = new Map();
   const MAX_VISUAL_PACKETS = 250;
+  const MAX_K = 16;
+  const MAX_FRAME_SECONDS = 0.1;  // clamp so a throttled/hidden tab cannot spawn a burst on resume
+  const MAX_UTIL_SECONDS = 2;
+  const MAX_HEAT_ROWS = 200;
+  const packetPool = [];          // reused <circle> elements
+  const heatRows = new Map();     // link.key → reusable heatmap row elements
+  const heatMoreEl = document.createElement("div");
 
   let viewState = { scale: 1, tx: 0, ty: 0 };
-  let viewDirty = false;
+  let viewDirty = false;   // transform changed
+  let scaleDirty = false;  // scale changed: node radii/labels need updating
+  let pathsDirty = false;  // lane offsets depend on scale and canvas size
   let isPanning = false;
   let panStartX = 0;
   let panStartY = 0;
@@ -700,8 +718,9 @@
   function log(message) {
     const line = document.createElement("div");
     line.className = "log-line";
-    const ts = new Date().toLocaleTimeString();
-    line.innerHTML = `<span>[${ts}]</span> ${message}`;
+    const stamp = document.createElement("span");
+    stamp.textContent = `[${new Date().toLocaleTimeString()}]`;
+    line.append(stamp, ` ${message}`);
     logBox.prepend(line);
     if (logBox.children.length > 80) {
       logBox.removeChild(logBox.lastChild);
@@ -727,9 +746,26 @@
   }
 
   function getHighlightPaths() {
-    return connections
+    const paths = connections
       .filter((conn) => conn.active && conn.paths && conn.paths.length)
       .flatMap((conn) => conn.paths.map((path) => ({ edges: path, color: conn.color })));
+    if (manualHighlight) paths.push(manualHighlight);
+    return paths;
+  }
+
+  function clearLinkStats() {
+    linkUtil.clear();
+    linkQueue.clear();
+    dirQueue.clear();
+    dirDrops.clear();
+    linkDropCount.clear();
+    linkOverflowUntil.clear();
+    nodeOverflowUntil.clear();
+  }
+
+  function clearHeatmap() {
+    heatmapEl.replaceChildren();
+    heatRows.clear();
   }
 
   function updateSelectAllState() {
@@ -742,19 +778,9 @@
   }
 
   function clampK(k) {
-    if (k < 2) return 2;
+    if (!Number.isFinite(k)) return 4;
+    k = Math.max(2, Math.min(MAX_K, k));
     return k % 2 === 0 ? k : k + 1;
-  }
-
-  function hostNode(id) {
-    return graph ? graph.nodeById.get(id) : null;
-  }
-
-  function hostPodKey(id) {
-    const node = hostNode(id);
-    if (!node) return "";
-    if (node.pod !== undefined) return `pod-${node.pod}`;
-    return node.parent ? `leaf-${node.parent}` : "";
   }
 
   function shuffle(array) {
@@ -793,8 +819,10 @@
   function buildPermutationPairs(hostIds) {
     const shuffled = shuffle([...hostIds]);
     const pairs = [];
+    // Both directions, so every paired host is a sender and a receiver (as in Tornado).
     for (let i = 0; i + 1 < shuffled.length; i += 2) {
       pairs.push([shuffled[i], shuffled[i + 1]]);
+      pairs.push([shuffled[i + 1], shuffled[i]]);
     }
     return pairs;
   }
@@ -876,14 +904,14 @@
       return { nodes, links, hostIds, layers: ["core", "edge", "host"], positions: layerY };
     }
 
-    if (tiers >= 3) {
+    if (tiers === 3) {
       for (let i = 0; i < coreCount; i++) {
         nodes.push({ id: `c${i}`, layer: "core", label: `C${i}`, color: palette.core, group: Math.floor(i / (k / 2)) });
       }
 
       for (let p = 0; p < pods; p++) {
         for (let a = 0; a < aggPerPod; a++) {
-          nodes.push({ id: `a${p}-${a}`, layer: "agg", label: `A${p}.${a}`, color: palette.agg, pod: p });
+          nodes.push({ id: `a${p}-${a}`, layer: "agg", label: `A${p}.${a}`, color: palette.agg, pod: p, idx: a });
         }
         for (let e = 0; e < edgePerPod; e++) {
           nodes.push({ id: `e${p}-${e}`, layer: "edge", label: `E${p}.${e}`, color: palette.edge, pod: p });
@@ -938,13 +966,29 @@
     const width = 1200;
     const padding = 70;
 
+    model.layerGap = {};
     layerOrder.forEach((layer) => {
       const items = layers[layer] || [];
       const gap = items.length > 1 ? (width - 2 * padding) / (items.length - 1) : 0;
+      model.layerGap[layer] = gap;
       items.forEach((node, index) => {
         node.x = padding + gap * index;
         node.y = model.positions[layer];
       });
+    });
+
+    // Lookups for ECMP path construction.
+    model.cores = layers.core || [];
+    model.aggsByPod = new Map();
+    model.coresByGroup = new Map();
+    (layers.agg || []).forEach((agg) => {
+      if (!model.aggsByPod.has(agg.pod)) model.aggsByPod.set(agg.pod, []);
+      model.aggsByPod.get(agg.pod).push(agg);
+    });
+    model.cores.forEach((core) => {
+      if (core.group === undefined) return;
+      if (!model.coresByGroup.has(core.group)) model.coresByGroup.set(core.group, []);
+      model.coresByGroup.get(core.group).push(core);
     });
 
     model.nodeById = new Map(model.nodes.map((n) => [n.id, n]));
@@ -958,89 +1002,26 @@
   function applyViewTransform() {
     if (!zoomLayerEl) return;
     zoomLayerEl.setAttribute('transform', `translate(${viewState.tx},${viewState.ty}) scale(${viewState.scale})`);
-    if (pathLayerEl && lastHighlightedPaths) rebuildPathHighlights(lastHighlightedPaths);
   }
 
-  function updateGraphPositions(scale) {
+  // Node X/Y are scale-independent (fixed in layoutGraph); only the counter-scaled
+  // radii and label placement depend on the zoom level.
+  function updateScaleSizes(scale) {
     if (!graph) return;
-    const effectiveWidth = 1200;
-    const padding = 70;
-
-    // Group nodes by layer and recompute X positions only (Y is fixed)
-    const layers = {};
-    graph.nodes.forEach((n) => {
-      if (!layers[n.layer]) layers[n.layer] = [];
-      layers[n.layer].push(n);
-    });
-
-    graph.layers.forEach((layer) => {
-      const items = layers[layer] || [];
-      const N = items.length;
-      const gap = N > 1 ? (effectiveWidth - 2 * padding) / (N - 1) : 0;
-      items.forEach((node, i) => {
-        node.x = padding + gap * i;
-      });
-    });
-
-    // Update SVG: only X coords + counter-scale node radii for proportional appearance
     graph.nodes.forEach((node) => {
+      const baseR = node.layer === 'host' ? 8 : 12;
       const circle = svgNodeEls.get(node.id);
-      if (circle) {
-        circle.setAttribute('cx', node.x);
-        circle.setAttribute('r', ((node.layer === 'host' ? 8 : 12) / scale).toFixed(3));
-      }
+      if (circle) circle.setAttribute('r', (baseR / scale).toFixed(3));
       const label = svgLabelEls.get(node.id);
       if (label) {
-        const baseR = node.layer === 'host' ? 8 : 12;
-        const N = (layers[node.layer] || []).length;
-        const screenGap = N > 1 ? (effectiveWidth - 2 * padding) / (N - 1) * scale : 200;
+        const gap = graph.layerGap[node.layer];
+        const screenGap = gap > 0 ? gap * scale : 200;
         const screenFontSize = Math.min(9.5, screenGap * 0.6);
         label.setAttribute('x', node.x + (baseR + 2) / scale);
         label.setAttribute('y', node.y + 4 / scale);
         label.style.fontSize = (screenFontSize / scale).toFixed(3) + 'px';
       }
     });
-
-    // Update edge X endpoints only
-    graph.links.forEach((link) => {
-      const el = svgLinkEls.get(link.key);
-      if (!el) return;
-      const s = graph.nodeById.get(link.source);
-      const t = graph.nodeById.get(link.target);
-      if (!s || !t) return;
-      el.line.setAttribute('x1', s.x);
-      el.line.setAttribute('x2', t.x);
-    });
-
-    // Update pod band X extents only (Y stays fixed at 150/390)
-    if (graph.layers.includes('agg')) {
-      svgPodBandEls.forEach(({ band, label }, pod) => {
-        const podNodes = graph.nodes.filter(
-          (n) => n.pod === pod && (n.layer === 'agg' || n.layer === 'edge')
-        );
-        if (!podNodes.length) return;
-        const xs = podNodes.map((n) => n.x);
-        const minX = Math.min(...xs) - 35;
-        const maxX = Math.max(...xs) + 35;
-        band.setAttribute('x', minX);
-        band.setAttribute('width', maxX - minX);
-        label.setAttribute('x', minX + 8);
-      });
-    }
-
-    rebuildPathHighlights(lastHighlightedPaths);
-    viewDirty = true;
-  }
-
-  function svgPointToScreen(svgX, svgY) {
-    const rect = svg.getBoundingClientRect();
-    const ctm = svg.getScreenCTM();
-    if (!ctm) return { x: 0, y: 0 };
-    const point = svg.createSVGPoint();
-    point.x = svgX;
-    point.y = svgY;
-    const transformed = point.matrixTransform(ctm);
-    return { x: transformed.x, y: transformed.y };
   }
 
   function screenPointToSvg(screenX, screenY) {
@@ -1060,6 +1041,7 @@
     svgNodeEls.clear();
     svgLabelEls.clear();
     svgPodBandEls.clear();
+    packetPool.length = 0;
 
     zoomLayerEl = document.createElementNS("http://www.w3.org/2000/svg", "g");
     zoomLayerEl.id = "zoomLayer";
@@ -1105,8 +1087,6 @@
       line.setAttribute("x2", target.x);
       line.setAttribute("y2", target.y);
       line.setAttribute("class", "edge");
-      line.setAttribute("stroke", "#cdbfb2");
-      line.setAttribute("stroke-width", "1.2");
       const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
       title.textContent = "";
       line.appendChild(title);
@@ -1148,8 +1128,9 @@
       const queue = linkQueue.get(link.key) || 0;
       const drops = linkDropCount.get(link.key) || 0;
       const color = mixColor("#cdbfb2", "#c04b4b", Math.min(1, util));
-      el.line.setAttribute("stroke", color);
-      el.line.setAttribute("stroke-width", (1.2 + Math.min(1, util) * 2).toFixed(2));
+      // CSS custom properties: a plain stroke attribute would lose to the .edge stylesheet rule.
+      el.line.style.setProperty("--u-stroke", color);
+      el.line.style.setProperty("--u-w", (1.2 + Math.min(1, util) * 2).toFixed(2));
       el.title.textContent = `util ${(util * 100).toFixed(0)}% | queue ${queue.toFixed(1)} / ${queueLimitPackets.toFixed(1)} pkts | drops ${drops.toFixed(0)}`;
       el.line.classList.toggle("overflow", (linkOverflowUntil.get(link.key) || 0) > now);
     });
@@ -1175,7 +1156,9 @@
         if (!group.colors.includes(path.color)) group.colors.push(path.color);
       });
     });
-    const pxPerUnit = svg.getBoundingClientRect().width / 1200 || 1;
+    // Screen px per user unit, including viewBox letterboxing.
+    const ctm = svg.getScreenCTM();
+    const pxPerUnit = ctm ? ctm.a : 1;
     shared.forEach(({ source, target, colors }) => {
       const n = colors.length;
       const laneW = Math.min(2.6 + 1.2 * (n - 1), 8) / n;
@@ -1201,25 +1184,46 @@
     });
   }
 
+  let hostOptionsProto = document.createDocumentFragment(); // all hosts as <option>, cloned on demand
+
   function fillHostOptions(hostIds) {
-    srcSelect.innerHTML = "";
-    dstSelect.innerHTML = "";
+    hostOptionsProto = document.createDocumentFragment();
     hostIds.forEach((id) => {
-      const opt1 = document.createElement("option");
-      opt1.value = id;
-      opt1.textContent = id;
-      const opt2 = opt1.cloneNode(true);
-      srcSelect.appendChild(opt1);
-      dstSelect.appendChild(opt2);
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = id;
+      hostOptionsProto.appendChild(opt);
     });
+    srcSelect.replaceChildren(hostOptionsProto.cloneNode(true));
+    dstSelect.replaceChildren(hostOptionsProto.cloneNode(true));
     if (hostIds.length > 1) {
       srcSelect.value = hostIds[0];
       dstSelect.value = hostIds[1];
     }
   }
 
+  // Per-row host selects start with only the current host and load the full list on first
+  // interaction, so a 500-connection preset on a large fabric does not create ~H^2 <option>s.
+  function makeHostSelect(value) {
+    const sel = document.createElement("select");
+    const current = document.createElement("option");
+    current.value = value;
+    current.textContent = value;
+    sel.appendChild(current);
+    const loadAll = () => {
+      if (sel.dataset.full) return;
+      sel.dataset.full = "1";
+      const selected = sel.value;
+      sel.replaceChildren(hostOptionsProto.cloneNode(true));
+      sel.value = selected;
+    };
+    sel.addEventListener("pointerdown", loadAll);
+    sel.addEventListener("focus", loadAll);
+    return sel;
+  }
+
   function refreshConnectionList() {
-    connList.innerHTML = "";
+    connList.replaceChildren();
     connections.forEach((conn) => {
       const row = document.createElement("div");
       row.className = "conn-row";
@@ -1228,18 +1232,8 @@
       swatch.className = "conn-swatch";
       swatch.style.background = conn.color;
 
-      const srcSel = document.createElement("select");
-      const dstSel = document.createElement("select");
-      graph.hostIds.forEach((id) => {
-        const optA = document.createElement("option");
-        optA.value = id;
-        optA.textContent = id;
-        const optB = optA.cloneNode(true);
-        srcSel.appendChild(optA);
-        dstSel.appendChild(optB);
-      });
-      srcSel.value = conn.src;
-      dstSel.value = conn.dst;
+      const srcSel = makeHostSelect(conn.src);
+      const dstSel = makeHostSelect(conn.dst);
 
       const rate = document.createElement("input");
       rate.type = "number";
@@ -1318,166 +1312,96 @@
     conn.paths = uniqueEcmpPaths(graph, conn.src, conn.dst, pathCount);
   }
 
-  function pathBetweenHosts(model, srcId, dstId) {
-    if (srcId === dstId) return [];
-
+  // Describes the equal-cost paths between two hosts without materialising them:
+  // { count, build(i) } where build(i) returns the i-th path as a list of edges.
+  function ecmpPathSource(model, srcId, dstId) {
+    const none = { count: 0, build: null };
+    if (srcId === dstId) return none;
     const src = model.nodeById.get(srcId);
     const dst = model.nodeById.get(dstId);
-    if (!src || !dst) return [];
+    if (!src || !dst) return none;
+
+    const srcEdge = src.parent;
+    const dstEdge = dst.parent;
+    if (srcEdge === dstEdge) {
+      const direct = [{ source: srcId, target: srcEdge }, { source: srcEdge, target: dstId }];
+      return { count: 1, build: () => direct.map((e) => ({ ...e })) };
+    }
 
     if (model.layers.length === 3) {
-      const srcLeaf = src.parent;
-      const dstLeaf = dst.parent;
-      if (srcLeaf === dstLeaf) {
+      // 2-tier leaf-spine: one path per spine.
+      return {
+        count: model.cores.length,
+        build: (i) => [
+          { source: srcId, target: srcEdge },
+          { source: srcEdge, target: model.cores[i].id },
+          { source: model.cores[i].id, target: dstEdge },
+          { source: dstEdge, target: dstId }
+        ]
+      };
+    }
+
+    const srcAggs = model.aggsByPod.get(src.pod) || [];
+    if (src.pod === dst.pod) {
+      return {
+        count: srcAggs.length,
+        build: (i) => [
+          { source: srcId, target: srcEdge },
+          { source: srcEdge, target: srcAggs[i].id },
+          { source: srcAggs[i].id, target: dstEdge },
+          { source: dstEdge, target: dstId }
+        ]
+      };
+    }
+
+    // Cross-pod: agg a in the source pod only reaches the cores of group a.
+    const perAgg = srcAggs.length ? (model.coresByGroup.get(srcAggs[0].idx) || []).length : 0;
+    return {
+      count: srcAggs.length * perAgg,
+      build: (i) => {
+        const agg = srcAggs[Math.floor(i / perAgg)];
+        const core = model.coresByGroup.get(agg.idx)[i % perAgg];
+        const dstAgg = model.nodeById.get(`a${dst.pod}-${agg.idx}`);
         return [
-          { source: srcId, target: srcLeaf },
-          { source: srcLeaf, target: dstId }
-        ];
-      }
-      const spines = model.nodes.filter((n) => n.layer === "core");
-      const spine = spines[Math.floor(Math.random() * spines.length)];
-      return [
-        { source: srcId, target: srcLeaf },
-        { source: srcLeaf, target: spine.id },
-        { source: spine.id, target: dstLeaf },
-        { source: dstLeaf, target: dstId }
-      ];
-    }
-
-    const srcEdge = src.parent;
-    const dstEdge = dst.parent;
-    const srcPod = src.pod;
-    const dstPod = dst.pod;
-
-    if (srcEdge === dstEdge) {
-      return [
-        { source: srcId, target: srcEdge },
-        { source: srcEdge, target: dstId }
-      ];
-    }
-
-    if (srcPod === dstPod) {
-      const aggs = model.nodes.filter((n) => n.layer === "agg" && n.pod === srcPod);
-      const agg = aggs[Math.floor(Math.random() * aggs.length)];
-      return [
-        { source: srcId, target: srcEdge },
-        { source: srcEdge, target: agg.id },
-        { source: agg.id, target: dstEdge },
-        { source: dstEdge, target: dstId }
-      ];
-    }
-
-    const aggOptions = model.nodes.filter((n) => n.layer === "agg" && n.pod === srcPod);
-    const agg = aggOptions[Math.floor(Math.random() * aggOptions.length)];
-    const aggIndex = parseInt(agg.id.split("-")[1], 10);
-    const coreOptions = model.nodes.filter((n) => n.layer === "core" && n.group === aggIndex);
-    const core = coreOptions[Math.floor(Math.random() * coreOptions.length)] || model.nodes.find((n) => n.layer === "core"); // fallback: any core
-    const dstAgg = model.nodeById.get(`a${dstPod}-${aggIndex}`);
-
-    return [
-      { source: srcId, target: srcEdge },
-      { source: srcEdge, target: agg.id },
-      { source: agg.id, target: core.id },
-      { source: core.id, target: dstAgg.id },
-      { source: dstAgg.id, target: dstEdge },
-      { source: dstEdge, target: dstId }
-    ];
-  }
-
-  function enumerateEcmpPaths(model, srcId, dstId) {
-    if (srcId === dstId) return [];
-    const src = model.nodeById.get(srcId);
-    const dst = model.nodeById.get(dstId);
-    if (!src || !dst) return [];
-
-    if (model.layers.length === 3) {
-      const srcLeaf = src.parent;
-      const dstLeaf = dst.parent;
-      if (srcLeaf === dstLeaf) {
-        return [[{ source: srcId, target: srcLeaf }, { source: srcLeaf, target: dstId }]];
-      }
-      return model.nodes
-        .filter((n) => n.layer === "core")
-        .map((spine) => [
-          { source: srcId, target: srcLeaf },
-          { source: srcLeaf, target: spine.id },
-          { source: spine.id, target: dstLeaf },
-          { source: dstLeaf, target: dstId }
-        ]);
-    }
-
-    const srcEdge = src.parent;
-    const dstEdge = dst.parent;
-    const srcPod = src.pod;
-    const dstPod = dst.pod;
-
-    if (srcEdge === dstEdge) {
-      return [[{ source: srcId, target: srcEdge }, { source: srcEdge, target: dstId }]];
-    }
-
-    if (srcPod === dstPod) {
-      return model.nodes
-        .filter((n) => n.layer === "agg" && n.pod === srcPod)
-        .map((agg) => [
           { source: srcId, target: srcEdge },
           { source: srcEdge, target: agg.id },
-          { source: agg.id, target: dstEdge },
+          { source: agg.id, target: core.id },
+          { source: core.id, target: dstAgg.id },
+          { source: dstAgg.id, target: dstEdge },
           { source: dstEdge, target: dstId }
-        ]);
-    }
-
-    const paths = [];
-    model.nodes
-      .filter((n) => n.layer === "agg" && n.pod === srcPod)
-      .forEach((agg) => {
-        const aggIndex = parseInt(agg.id.split("-")[1], 10);
-        const dstAgg = model.nodeById.get(`a${dstPod}-${aggIndex}`);
-        if (!dstAgg) return;
-        model.nodes
-          .filter((n) => n.layer === "core" && n.group === aggIndex)
-          .forEach((core) => {
-            paths.push([
-              { source: srcId, target: srcEdge },
-              { source: srcEdge, target: agg.id },
-              { source: agg.id, target: core.id },
-              { source: core.id, target: dstAgg.id },
-              { source: dstAgg.id, target: dstEdge },
-              { source: dstEdge, target: dstId }
-            ]);
-          });
-      });
-    return paths;
+        ];
+      }
+    };
   }
 
   function uniqueEcmpPaths(model, srcId, dstId, count) {
-    const all = enumerateEcmpPaths(model, srcId, dstId);
-    if (!all.length) return [];
-    const total = all.length;
+    const { count: total, build } = ecmpPathSource(model, srcId, dstId);
+    if (!total) return [];
     const take = Math.min(count, total);
+    const stride = total / take;
     const selected = [];
-    if (take === total) {
-      selected.push(...all);
-    } else {
-      // Evenly spaced stride distributes paths across all agg groups
-      const stride = total / take;
-      for (let i = 0; i < take; i++) {
-        selected.push(all[Math.floor(i * stride)]);
-      }
+    // Evenly spaced stride distributes paths across all agg groups
+    for (let i = 0; i < take; i++) {
+      const path = build(Math.floor(i * stride));
+      path.forEach((edge) => {
+        edge.key = linkKey(edge.source, edge.target);
+      });
+      selected.push(path);
     }
-    selected.forEach((path) => path.forEach((edge) => {
-      edge.key = linkKey(edge.source, edge.target);
-    }));
     return selected;
   }
 
   function spawnPacketFrom(src, dst, path, color) {
     if (!graph || !path.length) return;
 
-    if (packets.length < MAX_VISUAL_PACKETS) {
-      packets.push({ id: packetId++, path, index: 0, t: 0, color: color || "#9d3c3c" });
+    if (packets.length >= MAX_VISUAL_PACKETS) {
+      if (!streaming) log(`Packet not drawn (${src} → ${dst}): visual cap of ${MAX_VISUAL_PACKETS} packets reached.`);
+      return;
     }
+    const id = packetId++;
+    packets.push({ id, path, index: 0, t: 0, color: color || "#9d3c3c" });
 
-    if (!streaming) log(`Packet ${packetId - 1} sent (${src} → ${dst}) via ${path.length} hops.`);
+    if (!streaming) log(`Packet ${id} sent (${src} → ${dst}) via ${path.length} hops.`);
   }
 
   function spawnManualPacket() {
@@ -1491,8 +1415,9 @@
     const pathCount = Math.max(1, parseInt(pathCountInput.value, 10) || 1);
     const paths = uniqueEcmpPaths(graph, src, dst, pathCount);
     const path = paths[Math.floor(Math.random() * paths.length)];
-    if (!path.length) return;
-    lastHighlightedPaths = [{ edges: path, color: "#9d3c3c" }];
+    if (!path || !path.length) return;
+    manualHighlight = { edges: path, color: "#9d3c3c" };
+    lastHighlightedPaths = getHighlightPaths();
     rebuildPathHighlights(lastHighlightedPaths);
     spawnPacketFrom(src, dst, path, "#9d3c3c");
   }
@@ -1504,10 +1429,11 @@
     for (let i = 0; i < packets.length; i++) {
       const packet = packets[i];
       packet.t += deltaSeconds / hopDuration;
-      while (packet.t >= 1) {
-        packet.t -= 1;
-        packet.index += 1;
-        // advance index only; stats are rate-based, not count-based
+      // advance index only; stats are rate-based, not count-based
+      const steps = Math.floor(packet.t);
+      if (steps > 0) {
+        packet.t -= steps;
+        packet.index += steps;
       }
     }
 
@@ -1521,7 +1447,8 @@
 
   function renderPackets() {
     if (!packetLayerEl) return;
-    while (packetLayerEl.firstChild) packetLayerEl.removeChild(packetLayerEl.firstChild);
+    const radius = (5.5 / viewState.scale).toFixed(3); // keep on-screen size constant, like nodes
+    let used = 0;
 
     for (let i = 0; i < packets.length; i++) {
       const packet = packets[i];
@@ -1529,31 +1456,57 @@
       const source = graph.nodeById.get(edge.source);
       const target = graph.nodeById.get(edge.target);
       if (!source || !target) continue;
-      const x = source.x + (target.x - source.x) * packet.t;
-      const y = source.y + (target.y - source.y) * packet.t;
-      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-      circle.setAttribute("cx", x);
-      circle.setAttribute("cy", y);
-      circle.setAttribute("r", 5.5);
-      circle.setAttribute("class", "packet");
+      let circle = packetPool[used];
+      if (!circle) {
+        circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        circle.setAttribute("class", "packet");
+        packetPool[used] = circle;
+      }
+      used += 1;
+      circle.setAttribute("cx", source.x + (target.x - source.x) * packet.t);
+      circle.setAttribute("cy", source.y + (target.y - source.y) * packet.t);
+      circle.setAttribute("r", radius);
       circle.setAttribute("fill", packet.color);
-      packetLayerEl.appendChild(circle);
+      if (circle.parentNode !== packetLayerEl) packetLayerEl.appendChild(circle);
     }
+    for (let i = used; i < packetPool.length; i++) {
+      if (packetPool[i].parentNode) packetPool[i].remove();
+    }
+  }
+
+  function createHeatRow() {
+    const line = document.createElement("div");
+    line.className = "heat-row";
+    const label = document.createElement("div");
+    label.className = "heat-label";
+    const pct = document.createElement("div");
+    const queueDiv = document.createElement("div");
+    const drops = document.createElement("div");
+    const bar = document.createElement("div");
+    bar.className = "heat-bar";
+    const fill = document.createElement("div");
+    fill.className = "heat-fill";
+    bar.appendChild(fill);
+    line.append(label, pct, queueDiv, drops, bar);
+    return { line, label, pct, queueDiv, drops, fill };
+  }
+
+  function setText(el, text) {
+    if (el.textContent !== text) el.textContent = text;
   }
 
   function renderHeatmap(now = performance.now()) {
     if (!graph) return;
     const rows = [];
     graph.links.forEach((link) => {
-      const key = linkKey(link.source, link.target);
+      const key = link.key;
       const queuePkts = linkQueue.get(key) || 0;
       const queueFill = queueLimitPackets > 0 ? queuePkts / queueLimitPackets : 0;
       rows.push({
         key,
         util: linkUtil.get(key) || 0,
-        queue: queuePkts,
         queueFill,
-        drops: linkDropCount.get(key) || 0,
+        drops: Math.round(linkDropCount.get(key) || 0),
         overflow: (linkOverflowUntil.get(key) || 0) > now
       });
     });
@@ -1562,68 +1515,76 @@
       if (a.queueFill !== b.queueFill) return b.queueFill - a.queueFill;
       return b.util - a.util;
     });
-    heatmapEl.innerHTML = "";
 
     if (!rows.length) {
-      const empty = document.createElement("div");
-      empty.textContent = "No traffic yet.";
-      heatmapEl.appendChild(empty);
+      setText(heatmapEl, "No traffic yet.");
       return;
     }
 
-    rows.forEach((row) => {
-      const line = document.createElement("div");
-      line.className = "heat-row";
-      if (row.overflow) line.classList.add("overflow");
+    // Reuse row elements and reorder in place (rebuilding every row each second also
+    // restarted the overflow pulse animation).
+    const shown = rows.length > MAX_HEAT_ROWS ? rows.slice(0, MAX_HEAT_ROWS) : rows;
+    const order = shown.map((row) => {
+      let el = heatRows.get(row.key);
+      if (!el) {
+        el = createHeatRow();
+        const name = row.key.replace("|", " ↔ ");
+        el.label.textContent = name;
+        el.label.title = name;
+        heatRows.set(row.key, el);
+      }
+      el.line.classList.toggle("overflow", row.overflow);
+      setText(el.pct, `${Math.round(row.util * 100)}%`);
 
-      const label = document.createElement("div");
-      label.className = "heat-label";
-      label.textContent = row.key.replace("|", " ↔ ");
-      label.title = row.key.replace("|", " ↔ ");
-
-      const pct = document.createElement("div");
-      pct.textContent = `${Math.round(row.util * 100)}%`;
-
-      const queueDiv = document.createElement("div");
       if (queueLimitPackets > 0) {
-        queueDiv.textContent = `Q:${Math.round(row.queueFill * 100)}%`;
-        if (row.overflow) {
-          queueDiv.style.color = "#c04b4b";
-          queueDiv.style.fontWeight = "700";
-        } else if (row.queueFill > 0) {
-          queueDiv.style.color = "#d59f3f";
-          queueDiv.style.fontWeight = "700";
-        }
+        setText(el.queueDiv, `Q:${Math.round(row.queueFill * 100)}%`);
+        el.queueDiv.style.color = row.overflow ? "#c04b4b" : row.queueFill > 0 ? "#d59f3f" : "";
+        el.queueDiv.style.fontWeight = row.overflow || row.queueFill > 0 ? "700" : "";
       } else {
-        queueDiv.textContent = "Q:—";
-        queueDiv.style.color = "#aaa";
+        setText(el.queueDiv, "Q:—");
+        el.queueDiv.style.color = "#aaa";
+        el.queueDiv.style.fontWeight = "";
       }
 
-      const drops = document.createElement("div");
-      drops.textContent = row.drops ? `${row.drops.toFixed(0)}drop${row.drops === 1 ? "" : "s"}` : "0 drops";
-      if (row.overflow || row.drops > 0) drops.style.color = "#c04b4b";
-      if (row.overflow || row.drops > 0) drops.style.fontWeight = "700";
+      setText(el.drops, `${row.drops} drop${row.drops === 1 ? "" : "s"}`);
+      const hot = row.overflow || row.drops > 0;
+      el.drops.style.color = hot ? "#c04b4b" : "";
+      el.drops.style.fontWeight = hot ? "700" : "";
 
-      const bar = document.createElement("div");
-      bar.className = "heat-bar";
-      const fill = document.createElement("div");
-      fill.className = "heat-fill";
-      fill.style.transform = `scaleX(${Math.min(1, row.util)})`;
-      fill.style.background = mixColor("#2f8b40", "#c04b4b", Math.min(1, row.util));
-      bar.appendChild(fill);
-
-      line.appendChild(label);
-      line.appendChild(pct);
-      line.appendChild(queueDiv);
-      line.appendChild(drops);
-      line.appendChild(bar);
-      heatmapEl.appendChild(line);
+      el.fill.style.transform = `scaleX(${Math.min(1, row.util)})`;
+      el.fill.style.background = mixColor("#2f8b40", "#c04b4b", Math.min(1, row.util));
+      return el.line;
     });
+    if (rows.length > shown.length) {
+      setText(heatMoreEl, `+ ${rows.length - shown.length} more links (see export)`);
+      order.push(heatMoreEl);
+    }
+
+    let cursor = heatmapEl.firstChild;
+    order.forEach((node) => {
+      if (node === cursor) cursor = cursor.nextSibling;
+      else heatmapEl.insertBefore(node, cursor);
+    });
+    while (cursor) {
+      const next = cursor.nextSibling;
+      heatmapEl.removeChild(cursor);
+      cursor = next;
+    }
+  }
+
+  // Advance one direction's queue by elapsedSeconds; returns true if it overflowed.
+  function advanceQueue(dirKey, ingressRate, linkRate, queueLimit, elapsedSeconds) {
+    const rawNext = (dirQueue.get(dirKey) || 0) + (ingressRate - linkRate) * elapsedSeconds;
+    dirQueue.set(dirKey, Math.max(0, Math.min(queueLimit, rawNext)));
+    if (rawNext <= queueLimit) return false;
+    dirDrops.set(dirKey, (dirDrops.get(dirKey) || 0) + (rawNext - queueLimit));
+    return true;
   }
 
   function tick() {
+    requestAnimationFrame(tick); // first, so one failed frame cannot stop the loop
     const now = performance.now();
-    const deltaSeconds = (now - lastTick) / 1000;
+    const deltaSeconds = Math.min(MAX_FRAME_SECONDS, (now - lastTick) / 1000);
     lastTick = now;
 
     if (streaming) {
@@ -1643,16 +1604,16 @@
     if (now - lastUtilUpdate >= 1000) {
       const linkRate = Math.max(1, parseInt(linkRateInput.value, 10) || 1);
       const baseRtt = Math.max(1, parseInt(baseRttInput.value, 10) || 1) / 1000;
-      const bdpDepth = Math.max(0, parseInt(bdpDepthInput.value, 10) || 0);
+      const bdpDepth = Math.max(0, parseFloat(bdpDepthInput.value) || 0);
       const bdpPackets = linkRate * baseRtt;
       const queueLimit = bdpPackets * bdpDepth;
       queueLimitPackets = queueLimit;
-      const elapsedSeconds = (now - lastUtilUpdate) / 1000;
+      const elapsedSeconds = Math.min(MAX_UTIL_SECONDS, (now - lastUtilUpdate) / 1000);
 
       // Rate-based fluid model with DIRECTED keys.
-      // Each path edge has a specific source→target direction; we track ingress rate
-      // per direction so that bidirectional traffic on the same physical cable does
-      // not double-count. Utilisation is reported as the worse of the two directions.
+      // Each path edge has a specific source→target direction; ingress rate, queue and
+      // drops are tracked per direction (full-duplex ports have one queue each way).
+      // Utilisation and queue fill are reported as the worse of the two directions.
       const linkIngressRate = new Map(); // directed "src|dst" → rate
       if (streaming) {
         connections.forEach((conn) => {
@@ -1669,19 +1630,17 @@
 
       graph.links.forEach((link) => {
         const key = link.key;
-        const ingressFwd = linkIngressRate.get(`${link.source}|${link.target}`) || 0;
-        const ingressBwd = linkIngressRate.get(`${link.target}|${link.source}`) || 0;
-        const ingressRate = Math.max(ingressFwd, ingressBwd);
-        linkUtil.set(key, ingressRate / linkRate);
-        const queue = linkQueue.get(key) || 0;
-        const delta = (ingressRate - linkRate) * elapsedSeconds;
-        const rawNextQueue = queue + delta;
-        const overflowed = rawNextQueue > queueLimit;
-        const nextQueue = Math.max(0, Math.min(queueLimit, rawNextQueue));
-        linkQueue.set(key, nextQueue);
-        if (overflowed) {
-          const dropped = rawNextQueue - queueLimit;
-          linkDropCount.set(key, (linkDropCount.get(key) || 0) + dropped);
+        const fwdKey = `${link.source}|${link.target}`;
+        const bwdKey = `${link.target}|${link.source}`;
+        const ingressFwd = linkIngressRate.get(fwdKey) || 0;
+        const ingressBwd = linkIngressRate.get(bwdKey) || 0;
+        linkUtil.set(key, Math.max(ingressFwd, ingressBwd) / linkRate);
+
+        const overflowedFwd = advanceQueue(fwdKey, ingressFwd, linkRate, queueLimit, elapsedSeconds);
+        const overflowedBwd = advanceQueue(bwdKey, ingressBwd, linkRate, queueLimit, elapsedSeconds);
+        linkQueue.set(key, Math.max(dirQueue.get(fwdKey), dirQueue.get(bwdKey)));
+        linkDropCount.set(key, (dirDrops.get(fwdKey) || 0) + (dirDrops.get(bwdKey) || 0));
+        if (overflowedFwd || overflowedBwd) {
           linkOverflowUntil.set(key, now + 1200);
           const sourceNode = graph.nodeById.get(link.source);
           const targetNode = graph.nodeById.get(link.target);
@@ -1690,18 +1649,25 @@
         }
       });
       lastUtilUpdate = now;
-      lastHighlightedPaths = getHighlightPaths();
       updateDynamicGraphStyles(now);
-      rebuildPathHighlights(lastHighlightedPaths);
       renderHeatmap(now);
     }
 
     renderPackets();
+    if (scaleDirty) {
+      updateScaleSizes(viewState.scale);
+      scaleDirty = false;
+      viewDirty = true;
+      pathsDirty = true;
+    }
     if (viewDirty) {
       applyViewTransform();
       viewDirty = false;
     }
-    requestAnimationFrame(tick);
+    if (pathsDirty) {
+      rebuildPathHighlights(lastHighlightedPaths);
+      pathsDirty = false;
+    }
   }
 
   function downloadText(filename, content) {
@@ -1710,8 +1676,10 @@
     const a = document.createElement("a");
     a.href = url;
     a.download = filename;
+    document.body.appendChild(a);
     a.click();
-    URL.revokeObjectURL(url);
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
   function exportSimData() {
@@ -1781,7 +1749,7 @@
     });
     lines.push("");
 
-    const maxUtil = rows.length ? Math.max(...rows.map((r) => r.util)) : 0;
+    const maxUtil = rows.reduce((m, r) => Math.max(m, r.util), 0);
     const overloaded = rows.filter((r) => r.util > 1.001);
     const totalDrops = rows.reduce((s, r) => s + r.drops, 0);
     lines.push("--- SUMMARY ---");
@@ -1802,7 +1770,8 @@
     const previous = connections;
     graph = layoutGraph(buildFatTree(tiers, k));
     fillHostOptions(graph.hostIds);
-    connections = previous.filter((conn) => graph.hostIds.includes(conn.src) && graph.hostIds.includes(conn.dst));
+    const hostSet = new Set(graph.hostIds);
+    connections = previous.filter((conn) => hostSet.has(conn.src) && hostSet.has(conn.dst));
     connections.forEach((conn, index) => {
       if (!conn.color) {
         conn.color = connColors[index % connColors.length];
@@ -1810,17 +1779,18 @@
       conn.accumulator = 0;
       updateConnectionPaths(conn);
     });
+    manualHighlight = null;
     lastHighlightedPaths = getHighlightPaths();
-    linkUtil.clear();
-    linkQueue.clear();
-    linkOverflowUntil.clear();
-    nodeOverflowUntil.clear();
-    linkDropCount.clear();
+    clearLinkStats();
     queueLimitPackets = 0;
     nodeCountEl.textContent = String(graph.nodes.length);
     linkCountEl.textContent = String(graph.links.length);
     buildStaticGraphSVG(graph);
-    updateGraphPositions(1);
+    scaleDirty = false;
+    viewDirty = false;
+    pathsDirty = false;
+    updateScaleSizes(1);
+    rebuildPathHighlights(lastHighlightedPaths);
     packets = [];
     packetCountEl.textContent = "0";
     connCountEl.textContent = String(connections.length);
@@ -1828,7 +1798,7 @@
     streaming = false;
     startBtn.disabled = false;
     stopBtn.disabled = true;
-    heatmapEl.innerHTML = "";
+    clearHeatmap();
     log(`Topology rebuilt: ${tiers}-tier, k=${k}.`);
   }
 
@@ -1855,16 +1825,13 @@
     packets = [];
     packetCountEl.textContent = "0";
     connCountEl.textContent = "0";
-    linkUtil.clear();
-    linkQueue.clear();
-    linkDropCount.clear();
-    linkOverflowUntil.clear();
-    nodeOverflowUntil.clear();
+    clearLinkStats();
     refreshConnectionList();
+    manualHighlight = null;
     lastHighlightedPaths = [];
     rebuildPathHighlights([]);
     updateDynamicGraphStyles(performance.now());
-    heatmapEl.innerHTML = "";
+    clearHeatmap();
     log("Connections reset.");
   });
 
@@ -1900,7 +1867,7 @@
 
   document.getElementById("selectAllConns").addEventListener("change", (e) => {
     connections.forEach(c => { c.active = e.target.checked; });
-    refreshConnectionList();
+    connList.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = e.target.checked; });
     lastHighlightedPaths = getHighlightPaths();
     rebuildPathHighlights(lastHighlightedPaths);
   });
@@ -1915,7 +1882,7 @@
     if (!graph) return;
     const pairs = buildTornadoPairs(graph.hostIds);
     if (!pairs) {
-      log("Tornado preset needs at least two pods. Falling back to permutation.");
+      log("Tornado preset needs at least two hosts. Falling back to permutation.");
       createConnectionsFromPairs(buildPermutationPairs(graph.hostIds), "Permutation");
       return;
     }
@@ -1923,17 +1890,29 @@
   });
 
   // --- Zoom and pan controls ---
+  // Handlers only update viewState and set dirty flags; tick() applies them once per frame.
+  function zoomAbout(factor, cx, cy) {
+    const oldScale = viewState.scale;
+    viewState.scale = Math.max(0.3, Math.min(8, oldScale * factor));
+    const ratio = viewState.scale / oldScale;
+    viewState.tx = cx - (cx - viewState.tx) * ratio;
+    viewState.ty = cy - (cy - viewState.ty) * ratio;
+    scaleDirty = true;
+  }
+
+  function resetView() {
+    viewState.scale = 1;
+    viewState.tx = 0;
+    viewState.ty = 0;
+    scaleDirty = true;
+  }
+
   svg.addEventListener('wheel', (e) => {
     e.preventDefault();
-    if (!zoomLayerEl) return;
-    const oldScale = viewState.scale;
-    const delta = e.deltaY > 0 ? 0.85 : 1.15;
-    viewState.scale = Math.max(0.3, Math.min(8, viewState.scale * delta));
-    const ratio = viewState.scale / oldScale;
-    const svgPoint = screenPointToSvg(e.clientX, e.clientY);
-    viewState.tx = svgPoint.x - (svgPoint.x - viewState.tx) * ratio;
-    viewState.ty = svgPoint.y - (svgPoint.y - viewState.ty) * ratio;
-    updateGraphPositions(viewState.scale);
+    if (!zoomLayerEl || e.deltaY === 0) return;
+    const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY;
+    const point = screenPointToSvg(e.clientX, e.clientY);
+    zoomAbout(Math.exp(-dy * 0.0015), point.x, point.y);
   }, { passive: false });
 
   svg.addEventListener('mousedown', (e) => {
@@ -1951,10 +1930,9 @@
   document.addEventListener('mousemove', (e) => {
     if (!isPanning || !zoomLayerEl) return;
     const svgPoint = screenPointToSvg(e.clientX, e.clientY);
-    const deltaX = svgPoint.x - panStartX;
-    const deltaY = svgPoint.y - panStartY;
-    viewState.tx = panStartTx + deltaX * viewState.scale;
-    viewState.ty = panStartTy + deltaY * viewState.scale;
+    // tx/ty live in the outer SVG's user units, same as the pointer delta.
+    viewState.tx = panStartTx + (svgPoint.x - panStartX);
+    viewState.ty = panStartTy + (svgPoint.y - panStartY);
     viewDirty = true;
   });
 
@@ -1964,37 +1942,24 @@
     svg.classList.remove('panning');
   });
 
-  document.getElementById('resetViewBtn').addEventListener('click', () => {
-    viewState.scale = 1;
-    viewState.tx = 0;
-    viewState.ty = 0;
-    updateGraphPositions(1);
-  });
+  document.getElementById('resetViewBtn').addEventListener('click', resetView);
+
+  // Lane offsets of the path highlights depend on screen px per user unit.
+  window.addEventListener('resize', () => { pathsDirty = true; });
 
   document.addEventListener('keydown', (e) => {
-    if (document.activeElement !== document.body) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName))) return;
     if (e.key === '+' || e.key === '=') {
       e.preventDefault();
-      const oldScale = viewState.scale;
-      viewState.scale = Math.max(0.3, Math.min(8, viewState.scale * 1.2));
-      const ratio = viewState.scale / oldScale;
-      viewState.tx = 600 - (600 - viewState.tx) * ratio;
-      viewState.ty = 300 - (300 - viewState.ty) * ratio;
-      updateGraphPositions(viewState.scale);
+      zoomAbout(1.2, 600, 300);
     } else if (e.key === '-') {
       e.preventDefault();
-      const oldScale = viewState.scale;
-      viewState.scale = Math.max(0.3, Math.min(8, viewState.scale / 1.2));
-      const ratio = viewState.scale / oldScale;
-      viewState.tx = 600 - (600 - viewState.tx) * ratio;
-      viewState.ty = 300 - (300 - viewState.ty) * ratio;
-      updateGraphPositions(viewState.scale);
+      zoomAbout(1 / 1.2, 600, 300);
     } else if (e.key === '0') {
       e.preventDefault();
-      viewState.scale = 1;
-      viewState.tx = 0;
-      viewState.ty = 0;
-      updateGraphPositions(1);
+      resetView();
     } else if (e.key === 'ArrowLeft') {
       e.preventDefault();
       viewState.tx -= 50;
