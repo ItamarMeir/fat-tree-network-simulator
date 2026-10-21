@@ -685,6 +685,7 @@
   const _colorCache = new Map();
   const MAX_VISUAL_PACKETS = 250;
   const MAX_K = 16;
+  let nextConnId = 1; // unique per connection (Date.now()+random collided within a preset)
   const MAX_FRAME_SECONDS = 0.1;  // clamp so a throttled/hidden tab cannot spawn a burst on resume
   const MAX_UTIL_SECONDS = 2;
   const MAX_HEAT_ROWS = 200;
@@ -753,7 +754,12 @@
   function getHighlightPaths() {
     const paths = connections
       .filter((conn) => conn.active && conn.paths && conn.paths.length)
-      .flatMap((conn) => conn.paths.map((path) => ({ edges: path, color: conn.color })));
+      .flatMap((conn) => conn.paths.map((path) => ({
+        edges: path,
+        color: conn.color,
+        conn: conn.id,
+        weight: 1 / conn.paths.length // each path carries rate / paths.length (see tick)
+      })));
     if (manualHighlight) paths.push(manualHighlight);
     return paths;
   }
@@ -801,7 +807,7 @@
     const pathCount = Math.max(1, parseInt(pathCountInput.value, 10) || 1);
     connections = pairs.map((pair, index) => {
       const conn = {
-        id: Date.now() + Math.random(),
+        id: nextConnId++,
         src: pair[0],
         dst: pair[1],
         rate,
@@ -1145,28 +1151,37 @@
     });
   }
 
-  function rebuildPathHighlights(paths) {
-    if (!pathLayerEl) return;
-    while (pathLayerEl.firstChild) pathLayerEl.removeChild(pathLayerEl.firstChild);
-    // Group colors per physical link so connections sharing it are drawn as parallel lanes.
-    const shared = new Map();
+  // Share of each connection's traffic on each physical link: link key →
+  // { source, target, flows: Map(connId → { color, weight }) }, weight in (0, 1].
+  function groupFlowsByLink(paths) {
+    const links = new Map();
     paths.forEach((path) => {
       path.edges.forEach((edge) => {
         const source = graph.nodeById.get(edge.source);
         const target = graph.nodeById.get(edge.target);
         if (!source || !target) return;
         const key = linkKey(edge.source, edge.target);
-        if (!shared.has(key)) shared.set(key, { source, target, colors: [] });
-        const group = shared.get(key);
-        if (!group.colors.includes(path.color)) group.colors.push(path.color);
+        if (!links.has(key)) links.set(key, { source, target, flows: new Map() });
+        const flows = links.get(key).flows;
+        const flow = flows.get(path.conn) || { color: path.color, weight: 0 };
+        flow.weight += path.weight;
+        flows.set(path.conn, flow);
       });
     });
+    return links;
+  }
+
+  function rebuildPathHighlights(paths) {
+    if (!pathLayerEl) return;
+    while (pathLayerEl.firstChild) pathLayerEl.removeChild(pathLayerEl.firstChild);
     // Screen px per user unit, including viewBox letterboxing.
     const ctm = svg.getScreenCTM();
     const pxPerUnit = ctm ? ctm.a : 1;
-    // Sizes in screen px (path strokes are non-scaling). Shared links get wider lanes with a
-    // gap between them and a dark border around the whole bundle.
-    const SINGLE_W = 2.6, LANE_W = 3.5, LANE_MIN_W = 2, LANE_GAP = 1.5, MAX_BUNDLE = 28, BORDER = 1.5;
+    // Sizes in screen px (path strokes are non-scaling). A flow's lane is FULL_W wide on the
+    // links that carry all of its traffic and proportionally thinner where it is split over
+    // several paths. Flows sharing a link sit side by side inside a dark border; if the bundle
+    // exceeds MAX_BUNDLE all its lanes and gaps are scaled by the same factor (ratios are kept).
+    const FULL_W = 6, MIN_LANE_W = 0.5, LANE_GAP = 1.5, MAX_BUNDLE = 36, BORDER = 1.5;
     const SVG_NS = "http://www.w3.org/2000/svg";
     const addLine = (x1, y1, x2, y2, color, widthPx) => {
       const line = document.createElementNS(SVG_NS, "line");
@@ -1180,24 +1195,25 @@
       line.style.strokeLinecap = "butt";
       pathLayerEl.appendChild(line);
     };
-    shared.forEach(({ source, target, colors }) => {
-      const n = colors.length;
-      const laneW = n === 1
-        ? SINGLE_W
-        : Math.max(LANE_MIN_W, Math.min(LANE_W, (MAX_BUNDLE - (n - 1) * LANE_GAP) / n));
-      const step = laneW + LANE_GAP;
+    groupFlowsByLink(paths).forEach(({ source, target, flows }) => {
+      const lanes = [...flows.values()];
+      const n = lanes.length;
+      const natural = lanes.reduce((sum, f) => sum + FULL_W * f.weight, 0) + (n - 1) * LANE_GAP;
+      const fit = Math.min(1, MAX_BUNDLE / natural); // shrink lanes and gaps together
+      const gap = LANE_GAP * fit;
+      const widths = lanes.map((f) => Math.max(MIN_LANE_W, FULL_W * f.weight * fit));
+      const bundle = widths.reduce((sum, w) => sum + w, 0) + (n - 1) * gap;
       const dx = target.x - source.x;
       const dy = target.y - source.y;
       const len = Math.hypot(dx, dy) || 1;
-      if (n > 1) {
-        addLine(source.x, source.y, target.x, target.y, "#2b2622", n * laneW + (n - 1) * LANE_GAP + 2 * BORDER);
-      }
-      colors.forEach((color, i) => {
-        // Offset in screen px, converted to user units.
-        const off = ((i - (n - 1) / 2) * step) / (viewState.scale * pxPerUnit);
+      if (n > 1) addLine(source.x, source.y, target.x, target.y, "#2b2622", bundle + 2 * BORDER);
+      let cursor = -bundle / 2; // lane edge position across the link, in screen px
+      lanes.forEach((flow, i) => {
+        const off = (cursor + widths[i] / 2) / (viewState.scale * pxPerUnit);
+        cursor += widths[i] + gap;
         const ox = (-dy / len) * off;
         const oy = (dx / len) * off;
-        addLine(source.x + ox, source.y + oy, target.x + ox, target.y + oy, color, laneW);
+        addLine(source.x + ox, source.y + oy, target.x + ox, target.y + oy, flow.color, widths[i]);
       });
     });
   }
@@ -1434,7 +1450,7 @@
     const paths = uniqueEcmpPaths(graph, src, dst, pathCount);
     const path = paths[Math.floor(Math.random() * paths.length)];
     if (!path || !path.length) return;
-    manualHighlight = { edges: path, color: "#9d3c3c" };
+    manualHighlight = { edges: path, color: "#9d3c3c", conn: "manual", weight: 1 };
     lastHighlightedPaths = getHighlightPaths();
     rebuildPathHighlights(lastHighlightedPaths);
     spawnPacketFrom(src, dst, path, "#9d3c3c");
@@ -1864,7 +1880,7 @@
       return;
     }
     const conn = {
-      id: Date.now() + Math.random(),
+      id: nextConnId++,
       src,
       dst,
       rate: Math.max(1, parseInt(rateInput.value, 10) || 1),

@@ -12,6 +12,7 @@ No dependencies — open `fat_tree_simulator.html` in any modern browser.
 - **Topology builder** — 2-tier (spine-leaf) and 3-tier fat-tree, configurable k-ary parameter (power of 2: 2, 4, 8, 16)
 - **ECMP path selection** — deterministic enumeration of all (k/2)² cross-pod paths; configurable path count with balanced stride selection
 - **Traffic presets** — Tornado (half-tree shift permutation) and Permutation patterns; fully custom connections
+- **Flow-proportional path highlighting** — each connection is drawn in its own colour; its line is full width where all its traffic passes (host links) and proportionally thinner where it is split over ECMP paths (halves over 2 paths, uneven for odd path counts), widening again as paths merge. Connections sharing a link are shown as lanes inside a dark border
 - **Real-time animation** — packet dots travel along chosen ECMP paths at configurable link rate
 - **Queue & drop modelling** — fluid rate-based model with BDP-scaled queue depth; each cable direction has its own queue and drop counter, so bidirectional traffic is not double-counted
 - **Live heatmap** — links sorted by overflow, queue fill and utilisation (top 200 shown); shows util%, queue fill%, and drop count with overflow highlighting
